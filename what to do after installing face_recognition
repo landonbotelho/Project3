@@ -1,0 +1,3 @@
+nano ~/.bashrc
+
+export PYTHONPATH=$PYTHONPATH:/home/youruser/.local/lib/python3.8/site-packages
