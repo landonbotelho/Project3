@@ -138,13 +138,13 @@ def main(args=None):
     rclpy.init(args=args)
     node = FaceExplorer()
 
-    # Only trigger watchdog if not following face
-    def watchdog_timer():
+    # Only trigger obstacle aversion if not following face
+    def obstacle_timer():
         if not node.stopped and not node.following_face:
             node.get_logger().info("Assuming bump: initiating backup.")
             node.stop_and_backup()
 
-    node.create_timer(5.0, watchdog_timer)
+    node.create_timer(5.0, obstacle_timer)
 
     try:
         rclpy.spin(node)
