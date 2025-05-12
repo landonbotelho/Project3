@@ -1,70 +1,156 @@
 import os
+import math
+import random
+import numpy as np
+import cv2
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import Image
+from geometry_msgs.msg import Twist
 from cv_bridge import CvBridge
-import cv2
 from rclpy.qos import qos_profile_sensor_data
 import face_recognition
-import numpy
-#merging camera subscriber and face recognition example
-#https://github.com/ageitgey/face_recognition/blob/master/examples/facerec_from_webcam_faster.py#L3
-class CameraSubscriber(Node):
+
+class FaceExplorer(Node):
     def __init__(self):
-        super().__init__('camera_subscriber')
-        self.target_face = face_recognition.load_image_file("/home/landon/turtlebot4_ws/src/landon.jpg")
-        self.target_encoding= face_recognition.face_encodings(self.target_face)[0]
-        self.known_face_codes = [
-            self.target_encoding
-        ]
-        self.known_names = [ #what a hack make sure face code list and names list is in same order
-            "Landon"
-        ]
-        self.subscription = self.create_subscription(
+        super().__init__('project3v2_node')
+
+        # Load and encode target face
+        self.target_face = face_recognition.load_image_file(
+            "/home/landon/turtlebot4_ws/src/project3_package/landon.jpg")
+        self.target_encoding = face_recognition.face_encodings(self.target_face)[0]
+        self.known_face_codes = [self.target_encoding]
+        self.known_names = ["Landon"]
+
+        # ROS2 setup
+        self.bridge = CvBridge()
+        self.image_sub = self.create_subscription(
             Image,
             '/comp70/oakd/rgb/preview/image_raw',
-            self.listener_callback,
-            qos_profile_sensor_data)
-        self.bridge = CvBridge()
-        
+            self.image_callback,
+            qos_profile_sensor_data
+        )
+        self.cmd_pub = self.create_publisher(Twist, '/comp70/cmd_vel', 10)
 
-    def listener_callback(self, msg):
-        robot_view = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
-        # Convert the image from BGR color (which OpenCV uses) to RGB color (which face_recognition uses)
-        rgb_robot_view = numpy.ascontiguousarray(robot_view[:, :, ::-1])
-        # Find all the faces and face encodings in the current frame of video
-        face_locations = face_recognition.face_locations(rgb_robot_view)
-        # debugging print(f"{len(face_locations)} found!\nface locations: {face_locations}")
-        face_encodings = face_recognition.face_encodings(rgb_robot_view, face_locations)
+        # Movement state
+        self.face_found = False
+        self.face_center_x = None
+        self.frame_width = 640
+        self.backing_up = False
+        self.backup_counter = 0
+        self.stopped = False
+        self.following_face = False
+
+        # Movement speeds
+        self.linear_speed = 0.25
+        self.angular_speed = 1.2
+
+        # Main movement loop
+        self.timer = self.create_timer(0.3, self.move_robot)
+
+    def image_callback(self, msg):
+        if self.stopped:
+            return  # Skip if permanently stopped
+
+        frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+        self.frame_width = frame.shape[1]
+        rgb_frame = np.ascontiguousarray(frame[:, :, ::-1])
+
+        face_locations = face_recognition.face_locations(rgb_frame)
+        face_encodings = face_recognition.face_encodings(rgb_frame, face_locations)
         found_face_names = []
-        for face_encoding in face_encodings:
-            # See if the face is a match for the known face(s)
-            matches = face_recognition.compare_faces( self.known_face_codes, face_encoding)
-            name = "Unknown"
+        self.face_center_x = None
+
+        for face_encoding, (top, right, bottom, left) in zip(face_encodings, face_locations):
+            matches = face_recognition.compare_faces(self.known_face_codes, face_encoding)
             face_distances = face_recognition.face_distance(self.known_face_codes, face_encoding)
-            best_match_index = numpy.argmin(face_distances)
+            best_match_index = np.argmin(face_distances)
+
             if matches[best_match_index]:
-                name = self.known_names[best_match_index]
+                found_face_names.append(self.known_names[best_match_index])
+                self.face_center_x = (left + right) // 2
 
-            found_face_names.append(name)
-        # Display the results
+        # Draw boxes for visualization
         for (top, right, bottom, left), name in zip(face_locations, found_face_names):
-            # Draw a box around the face
-            cv2.rectangle(robot_view, (left, top), (right, bottom), (0, 0, 255), 2)
+            cv2.rectangle(frame, (left, top), (right, bottom), (0, 255, 0), 2)
+            cv2.putText(frame, name, (left, bottom + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
 
-            # Draw a label with a name below the face
-            cv2.rectangle(robot_view, (left, bottom - 35), (right, bottom), (0, 0, 255), cv2.FILLED)
-            font = cv2.FONT_HERSHEY_DUPLEX
-            cv2.putText(robot_view, name, (left + 6, bottom - 6), font, 1.0, (255, 255, 255), 1)
-        cv2.imshow('Camera Feed', robot_view)
+        cv2.imshow("Face Detection", frame)
         if cv2.waitKey(1) & 0xFF == ord('q'):
-            os.exit(0)
+            os._exit(0)
+
+        # Start following behavior only once
+        if "Landon" in found_face_names and not self.face_found and not self.stopped:
+            self.get_logger().info("Target face detected. Following for 20 seconds...")
+            self.face_found = True
+            self.following_face = True
+            self.create_timer(20.0, self.stop_completely)  # Stop after 20s
+
+    def move_robot(self):
+        twist = Twist()
+
+        if self.stopped:
+            self.cmd_pub.publish(twist)  # Stay stopped
+            return
+
+        # Handle backup mode
+        if self.backing_up:
+            if self.backup_counter < 10:
+                twist.linear.x = -0.15
+                twist.angular.z = random.choice([-1.0, 1.0])
+                self.backup_counter += 1
+                self.cmd_pub.publish(twist)
+                return
+            else:
+                self.backing_up = False
+                self.backup_counter = 0
+
+        # Face-following behavior
+        if self.following_face and self.face_center_x is not None:
+            error = (self.frame_width // 2) - self.face_center_x
+            twist.linear.x = 0.2
+            twist.angular.z = float(error) / 100.0  # Proportional steering
+            self.get_logger().info("Following face...")
+        elif not self.face_found:
+            # Random exploration
+            twist.linear.x = self.linear_speed
+            twist.angular.z = random.uniform(-self.angular_speed, self.angular_speed)
+
+        self.cmd_pub.publish(twist)
+
+    def stop_completely(self):
+        if not self.stopped:
+            self.get_logger().info("Stopping permanently after face follow.")
+            self.stopped = True
+            self.following_face = False
+            self.stop_robot()
+
+    def stop_and_backup(self):
+        if not self.stopped:
+            self.backing_up = True
+            self.backup_counter = 0
+
+    def stop_robot(self):
+        twist = Twist()
+        self.cmd_pub.publish(twist)
 
 def main(args=None):
     rclpy.init(args=args)
-    camera_subscriber = CameraSubscriber()
-    rclpy.spin(camera_subscriber)
-    camera_subscriber.destroy_node()
+    node = FaceExplorer()
+
+    # Only trigger watchdog if not following face
+    def watchdog_timer():
+        if not node.stopped and not node.following_face:
+            node.get_logger().info("Assuming bump: initiating backup.")
+            node.stop_and_backup()
+
+    node.create_timer(5.0, watchdog_timer)
+
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        node.stop_robot()
+    node.destroy_node()
     rclpy.shutdown()
 
 if __name__ == '__main__':
